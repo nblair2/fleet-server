@@ -1352,3 +1352,113 @@ func TestMonitor_CallerStopsWaitingForASharedLoadWhenItsContextEnds(t *testing.T
 		assert.Equal(t, int64(3), leaderRev, "the load goes on for the caller that still waits for it")
 	})
 }
+
+// A load started by GetPolicy or LatestRev runs outside of the Run loop. When it brings the policy
+// that subscribers already wait for, it has to wake the dispatcher itself: no load kick or
+// policy change may follow to do it.
+func TestMonitor_LoadOutsideOfRunLoopDispatchesToWaitingSubscribers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ms := mmock.NewMockSubscription()
+		ms.On("Output").Return((<-chan []es.HitT)(make(chan []es.HitT)))
+		mm := mmock.NewMockMonitor()
+		mm.On("Subscribe").Return(ms).Once()
+		mm.On("Unsubscribe", mock.Anything).Return().Once()
+		p := newTestPolicy(3)
+		release := make(chan struct{})
+		var calls atomic.Int32
+		pm := NewMonitor(ftesting.NewMockBulk(), mm, config.ServerLimits{}).(*monitorT)
+		pm.policiesF = func(context.Context, bulk.Bulk, []string, ...dl.Option) ([]model.Policy, error) {
+			if calls.Add(1) == 1 {
+				// The load of the check-in that misses the cache: a slow search that finds the policy.
+				<-release
+				return []model.Policy{p}, nil
+			}
+			// The load kicked by Subscribe: for example the policy is not searchable on this shard yet.
+			return nil, nil
+		}
+
+		ctx, cancel := context.WithCancel(t.Context())
+		var wg sync.WaitGroup
+		wg.Go(func() { assert.NoError(t, pm.Run(ctx)) })
+		require.NoError(t, pm.waitStart(ctx))
+
+		// A check-in misses the cache and starts a load.
+		wg.Go(func() {
+			_, err := pm.GetPolicy(t.Context(), p.PolicyID)
+			assert.NoError(t, err)
+		})
+		synctest.Wait() // the load waits for its search
+
+		// Another agent subscribes to the same policy meanwhile, as a check-in does when its own
+		// GetPolicy failed or was given up. The load that it kicks ends without the policy.
+		first, err := pm.Subscribe("agent-1", p.PolicyID, 0)
+		require.NoError(t, err)
+		synctest.Wait()
+		require.Equal(t, int32(2), calls.Load(), "the subscription kicked a load")
+
+		// The first load ends and queues agent-1 for dispatch.
+		close(release)
+		synctest.Wait()
+
+		// Agents that subscribe from now on find the policy and queue behind agent-1.
+		second, err := pm.Subscribe("agent-2", p.PolicyID, 0)
+		require.NoError(t, err)
+		time.Sleep(time.Second) // let the rate limiter of the dispatches pass
+		synctest.Wait()
+
+		for i, s := range []Subscription{first, second} {
+			select {
+			case pp := <-s.Output():
+				assert.Equal(t, p.RevisionIdx, pp.Policy.RevisionIdx)
+			default:
+				assert.Failf(t, "the subscription did not get the policy", "agent-%d", i+1)
+			}
+		}
+		cancel()
+		wg.Wait()
+	})
+}
+
+// A subscriber must wake the dispatcher even when other subscribers are queued already: nothing
+// guarantees that a drain is still due for them.
+func TestMonitor_SubscribeDispatchesWhenThePendingQueueIsNotEmpty(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ms := mmock.NewMockSubscription()
+		ms.On("Output").Return((<-chan []es.HitT)(make(chan []es.HitT)))
+		mm := mmock.NewMockMonitor()
+		mm.On("Subscribe").Return(ms).Once()
+		mm.On("Unsubscribe", mock.Anything).Return().Once()
+		p := newTestPolicy(3)
+		pm := NewMonitor(ftesting.NewMockBulk(), mm, config.ServerLimits{}).(*monitorT)
+		pp, err := NewParsedPolicy(t.Context(), pm.bulker, p)
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		var wg sync.WaitGroup
+		wg.Go(func() { assert.NoError(t, pm.Run(ctx)) })
+		require.NoError(t, pm.waitStart(ctx))
+		pm.updatePolicy(ctx, pp)
+
+		// A subscriber is left in the pending queue with no drain due.
+		stranded := NewSub(p.PolicyID, "agent-1", 0)
+		pm.mut.Lock()
+		pm.pendingQ.pushBack(stranded)
+		pm.mut.Unlock()
+
+		sub, err := pm.Subscribe("agent-2", p.PolicyID, 0)
+		require.NoError(t, err)
+		time.Sleep(time.Second) // let the rate limiter of the dispatches pass
+		synctest.Wait()
+
+		for i, s := range []Subscription{stranded, sub} {
+			select {
+			case got := <-s.Output():
+				assert.Equal(t, p.RevisionIdx, got.Policy.RevisionIdx)
+			default:
+				assert.Failf(t, "the subscription did not get the policy", "agent-%d", i+1)
+			}
+		}
+		cancel()
+		wg.Wait()
+	})
+}

@@ -1,0 +1,9 @@
+kind: bug-fix
+summary: Fix policy monitor stalling so agents check in but never receive their policy
+description: |
+  The policy monitor could queue agents for policy delivery without waking its
+  dispatcher, when a policy was loaded on a check-in cache miss while agents were
+  already waiting for it. Agents that subscribed afterwards queued behind them
+  without waking the dispatcher either, so no policy was delivered until an
+  unrelated policy change. Affected agents stayed in the Updating state.
+component: fleet-server

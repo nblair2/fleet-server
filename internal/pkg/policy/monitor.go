@@ -592,6 +592,12 @@ func (m *monitorT) updatePolicy(ctx context.Context, pp *ParsedPolicy) bool {
 		Str(ecs.PolicyID, newPolicy.PolicyID).
 		Msg("New revision of policy received and added to the queue")
 
+	// Wake the dispatcher here and not in the callers: a load started by LatestRev or GetPolicy
+	// runs outside of the Run loop, where no kick follows.
+	if nQueued > 0 {
+		m.kickDeploy()
+	}
+
 	return true
 }
 
@@ -649,15 +655,14 @@ func (m *monitorT) Subscribe(agentID string, policyID string, revisionIdx int64)
 		m.loadQ[policyID] = struct{}{}
 		m.kickLoad()
 	case s.isUpdate(&p.pp.Policy):
-		empty := m.pendingQ.isEmpty()
 		m.pendingQ.pushBack(s)
 		m.log.Debug().
 			Str(ecs.AgentID, s.agentID).
 			Int64(ecs.RevisionIdx, (&p.pp.Policy).RevisionIdx).
 			Msg("deploy pending on subscribe")
-		if empty {
-			m.kickDeploy()
-		}
+		// Always kick: a queue that is not empty does not mean that a drain is due. If one is,
+		// the kick is dropped or causes one more drain that finds nothing.
+		m.kickDeploy()
 	default:
 		m.log.Debug().
 			Str(ecs.PolicyID, policyID).
