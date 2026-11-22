@@ -1366,7 +1366,8 @@ func TestMonitor_LoadOutsideOfRunLoopDispatchesToWaitingSubscribers(t *testing.T
 		p := newTestPolicy(3)
 		release := make(chan struct{})
 		var calls atomic.Int32
-		pm := NewMonitor(ftesting.NewMockBulk(), mm, config.ServerLimits{}).(*monitorT)
+		pm, ok := NewMonitor(ftesting.NewMockBulk(), mm, config.ServerLimits{}).(*monitorT)
+		require.True(t, ok)
 		pm.policiesF = func(context.Context, bulk.Bulk, []string, ...dl.Option) ([]model.Policy, error) {
 			if calls.Add(1) == 1 {
 				// The load of the check-in that misses the cache: a slow search that finds the policy.
@@ -1429,7 +1430,8 @@ func TestMonitor_SubscribeDispatchesWhenThePendingQueueIsNotEmpty(t *testing.T) 
 		mm.On("Subscribe").Return(ms).Once()
 		mm.On("Unsubscribe", mock.Anything).Return().Once()
 		p := newTestPolicy(3)
-		pm := NewMonitor(ftesting.NewMockBulk(), mm, config.ServerLimits{}).(*monitorT)
+		pm, ok := NewMonitor(ftesting.NewMockBulk(), mm, config.ServerLimits{}).(*monitorT)
+		require.True(t, ok)
 		pp, err := NewParsedPolicy(t.Context(), pm.bulker, p)
 		require.NoError(t, err)
 
